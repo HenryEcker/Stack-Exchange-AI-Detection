@@ -1,50 +1,100 @@
-import pandas as pd
-from transformers import pipeline, RobertaTokenizer
-from stackapi import StackAPI
-from html2text import html2text
 from datetime import datetime, timedelta
+from typing import Iterable, Generator, TypedDict
+
+import pandas as pd
+from html2text import html2text
+from stackapi import StackAPI
+from transformers import pipeline, RobertaTokenizer, Pipeline
+
+LABEL_DICT = {"LABEL_0": "AI Generated", "LABEL_1": "Human"}
+ROBERTA_CONFIG = {
+    'model': 'roberta-base-openai-detector',
+    'truncation': True
+}
+CLASS_PIPELINE = pipeline(model=ROBERTA_CONFIG['model'], truncation=ROBERTA_CONFIG['truncation'])
+TOKENIZER = RobertaTokenizer.from_pretrained(ROBERTA_CONFIG['model'], truncation=ROBERTA_CONFIG['truncation'])
+SE_API = StackAPI('stackoverflow', key='wuBIf6UmmChWWUNCAM*Rmg((')
 
 
-class_pipeline = pipeline(model='roberta-base-openai-detector',
-                          truncation=True)
+class NoResultsException(Exception):
+    def __init__(self, *args):
+        super(NoResultsException, self).__init__(self, *args)
 
-tokenizer = RobertaTokenizer.from_pretrained('roberta-base-openai-detector',truncation=True)
 
-label_dict = {"LABEL_0" : "AI Generated", "LABEL_1" : "Human"}
+class Post(TypedDict):
+    body: str
+    post_id: str
+    title: str
 
-api = StackAPI('stackoverflow',key='wuBIf6UmmChWWUNCAM*Rmg((')
-for id in [74680771]:
-    post = api.fetch('posts', ids=[id], filter='!LH22Vfx-WtNBnMCP-eADaa')
+
+class PostResults(TypedDict):
+    ID: str
+    Title: str
+    Length: int
+    Class: str
+    Score: float
+
+
+def process_items(items: Iterable[Post]) -> Generator[PostResults, None, None]:
+    for item in items:
+        body = html2text(item['body'])
+        result = CLASS_PIPELINE(body)
+        yield {
+            'ID': item['post_id'],
+            'Title': item['title'],
+            'Length': len(TOKENIZER(body)['input_ids']),
+            'Class': LABEL_DICT[result[0]['label']],
+            'Score': round(result[0]['score'], 3)
+        }
+
+
+def lookup_user(user_id: int, time_delta=timedelta(days=2)) -> pd.DataFrame:
+    from_date = datetime.now() - time_delta
+
+    answers = SE_API.fetch(
+        'users/{ids}/answers',
+        fromdate=from_date,
+        ids=[user_id]
+    )
+
+    answer_ids = [item['answer_id'] for item in answers['items']]
+    if not answer_ids:
+        raise NoResultsException('This user has no answers!')
+
+    answers_text = SE_API.fetch(
+        'posts',
+        ids=answer_ids,
+        filter='!LH22Vfx-WtNBnMCP-eADaa'
+    )
+
+    return pd.DataFrame(process_items(answers_text['items']))
+
+
+def lookup_post(post_id: int) -> Pipeline:
+    post = SE_API.fetch('posts', ids=[post_id], filter='!LH22Vfx-WtNBnMCP-eADaa')
+    items = post['items']
+    if not items:
+        raise NoResultsException('No content found for this post!')
     body = html2text(post['items'][0]['body'])
+    return CLASS_PIPELINE(body)
 
-    result = class_pipeline(body)
-    print('Result: '+label_dict[result[0]['label']]+' - Score: '+str(round(result[0]['score'],3)))
 
-for userid in [20704445]:
-    lookback = datetime.now() - timedelta(days=2)
-    answers = api.fetch('users/{ids}/answers', fromdate=lookback, todate=datetime.now(), ids=[userid])
-    answer_ids = []
-    for item in answers['items']:
-        answer_ids.append(item['answer_id'])
+def main():
+    for post_id in [74680771]:
+        try:
+            result = lookup_post(post_id)
+            print(f"Result: {LABEL_DICT[result[0]['label']]} - Score: {str(round(result[0]['score'], 3))}")
+        except NoResultsException:
+            pass  # Or something
 
-    answers_text = api.fetch('posts', ids = answer_ids, filter='!LH22Vfx-WtNBnMCP-eADaa')
-    id_list = []
-    title_list = []
-    length_list = []
-    class_list = []
-    score_list = []
-    for text in answers_text['items']:
-        body = html2text(text['body'])
-        result = class_pipeline(body)
-        id_list.append(text['post_id'])
-        title_list.append(text['title'])
-        length_list.append(len(tokenizer(body)['input_ids']))
-        class_list.append(label_dict[result[0]['label']])
-        score_list.append(round(result[0]['score'],3))
-    result_df = pd.DataFrame({'ID':id_list,
-                              'Title':title_list,
-                              'Length':length_list,
-                              'Class':class_list,
-                              'Score':score_list})
-    print(result_df)
+    for user_id in [20704445]:
+        try:
+            result_df = lookup_user(user_id)
+            with pd.option_context('display.width', None):
+                print(result_df)
+        except NoResultsException:
+            pass  # Or something
 
+
+if __name__ == '__main__':
+    main()
